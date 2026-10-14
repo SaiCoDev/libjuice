@@ -40,6 +40,8 @@ int conn_mux_attach_request(conn_registry_t *registry, uint64_t id, juice_agent_
 int conn_mux_reject_request(conn_registry_t *registry, uint64_t id);
 void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats);
 int conn_mux_set_admission(conn_registry_t *registry, const juice_mux_admission_t *admission);
+int conn_mux_set_proxy_protocol(conn_registry_t *registry, const char *const *proxies,
+                                size_t count);
 conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config);
 bool conn_mux_can_release_registry(conn_registry_t *registry);
 

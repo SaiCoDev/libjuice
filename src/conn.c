@@ -285,6 +285,33 @@ int juice_mux_listen(const char *address, int port, juice_cb_mux_incoming_t cb,
 	return result;
 }
 
+int juice_mux_set_proxy_protocol(const char *address, int port, const char *const *proxies,
+                                 size_t count) {
+	if (port < 1 || port > 65535 || (count && !proxies)) return JUICE_ERR_INVALID;
+	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
+	udp_socket_config_t config = {0};
+	config.bind_address = address;
+	config.port_begin = config.port_end = port;
+	mutex_lock(&entry->mutex);
+	conn_registry_t *registry;
+	if (count) {
+		if (acquire_registry(entry, &config, &registry)) {
+			mutex_unlock(&entry->mutex);
+			return JUICE_ERR_FAILED;
+		}
+	} else if ((registry = entry->get_registry_func(&config))) {
+		mutex_lock(&registry->mutex);
+	} else {
+		// Nothing to clear, and clearing must not open the endpoint
+		mutex_unlock(&entry->mutex);
+		return 0;
+	}
+	int result = conn_mux_set_proxy_protocol(registry, proxies, count);
+	release_registry(entry, registry);
+	mutex_unlock(&entry->mutex);
+	return result;
+}
+
 int juice_mux_listen_pending(const char *address, int port,
                             const juice_mux_pending_config_t *pending_config,
                             juice_cb_mux_pending_t cb, void *user_ptr) {

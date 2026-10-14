@@ -10,6 +10,7 @@
 #include "agent.h"
 #include "base64.h"
 #include "log.h"
+#include "mux_proxy.h"
 #include "socket.h"
 #include "stun.h"
 #include "thread.h"
@@ -111,6 +112,8 @@ typedef struct registry_impl {
 	uint64_t notifications;
 	uint64_t duplicates;
 	void *mux_incoming_user_ptr;
+	// Swapped under both the registry lock and send_mutex. Sends route through it under send_mutex
+	mux_proxy_t *proxy;
 } registry_impl_t;
 
 typedef struct conn_impl {
@@ -573,6 +576,7 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	destroy_admission(registry_impl);
 	free(registry_impl->pending_buckets);
 	free(registry_impl->pending_ids);
+	mux_proxy_destroy(registry_impl->proxy);
 
 	if (registry_impl->conn_mux_registries_index > -1) {
 		int i = registry_impl->conn_mux_registries_index;
@@ -617,7 +621,8 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 
 	int count = registry->agents_count;
 	registry_impl_t *impl = registry->impl;
-	if (impl->cb_mux_incoming || impl->cb_mux_pending || impl->pending_closing)
+	// Whatever keeps the registry also keeps its thread, as agents may join later
+	if (impl->cb_mux_incoming || impl->cb_mux_pending || impl->pending_closing || impl->proxy)
 		++count;
 	if (impl->notify_head || impl->ready_head) *next_timestamp = now;
 	else if (impl->expiry_head && *next_timestamp > impl->expiry_head->deadline)
@@ -768,7 +773,8 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	}
 
     registry_impl_t *impl = registry->impl;
-	expire_pending(impl, current_timestamp());
+	timestamp_t now = current_timestamp();
+	expire_pending(impl, now);
 	while (impl->ready_head) {
 		pending_request_t *request = impl->ready_head;
 		juice_agent_t *agent = request->agent;
@@ -798,7 +804,13 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 			}
 
 			++impl->received;
-			process_datagram(registry, buffer, (size_t)ret, &src);
+			char *data = buffer;
+			size_t size = (size_t)ret;
+			if (impl->proxy && mux_proxy_receive(impl->proxy, &data, &size, &src, now) != 0) {
+				++impl->rejected;
+				continue;
+			}
+			process_datagram(registry, data, size, &src);
 		}
 
 		if (ret < 0) {
@@ -980,7 +992,10 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto(registry_impl->sock, data, size, dst);
+	// A client behind a relay is reached through it
+	const addr_record_t *to =
+	    registry_impl->proxy ? mux_proxy_route(registry_impl->proxy, dst) : dst;
+	int ret = udp_sendto(registry_impl->sock, data, size, to);
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
@@ -1047,7 +1062,7 @@ bool conn_mux_can_release_registry(conn_registry_t *registry) {
 	}
 
 	return registry_impl->cb_mux_incoming == NULL && registry_impl->cb_mux_pending == NULL &&
-	       !registry_impl->pending_closing;
+	       !registry_impl->pending_closing && !registry_impl->proxy;
 }
 
 int conn_mux_listen_pending(conn_registry_t *registry, const juice_mux_pending_config_t *config,
@@ -1203,5 +1218,25 @@ int conn_mux_set_admission(conn_registry_t *registry, const juice_mux_admission_
 	}
 	destroy_admission(impl);
 	impl->admission = admission;
+	return 0;
+}
+
+int conn_mux_set_proxy_protocol(conn_registry_t *registry, const char *const *proxies,
+                                size_t count) {
+	// The caller holds the registry lock, so nothing receives meanwhile
+	registry_impl_t *impl = registry->impl;
+	mux_proxy_t *proxy = NULL;
+	if (count) {
+		int ret = mux_proxy_create(proxies, count, &impl->send_mutex, impl->proxy, &proxy);
+		if (ret != 0)
+			return ret;
+	}
+	mutex_lock(&impl->send_mutex);
+	mux_proxy_t *previous = impl->proxy;
+	impl->proxy = proxy;
+	mutex_unlock(&impl->send_mutex);
+	mux_proxy_destroy(previous);
+	// So the thread sees whether it is still needed. A failure logs, and its poll times out anyway.
+	conn_mux_interrupt_registry(registry);
 	return 0;
 }

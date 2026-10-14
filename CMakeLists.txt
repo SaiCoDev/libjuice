@@ -50,6 +50,7 @@ set(LIBJUICE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/ice.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/juice.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/log.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/mux_proxy.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/random.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/server.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/stun.c
@@ -274,7 +275,7 @@ if(PENDING_MUX_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(mux-pending-bench PRIVATE src include/juice)
     target_compile_definitions(mux-pending-bench PRIVATE BENCH_INDEXED_PENDING=1)
     target_link_libraries(mux-pending-bench PRIVATE juice-static Threads::Threads)
-    foreach(test_name IN ITEMS mux_pending mux_pending_lifetime mux_authentication mux_direct mux_admission)
+    foreach(test_name IN ITEMS mux_pending mux_pending_lifetime mux_authentication mux_direct mux_admission mux_proxy_protocol)
         string(REPLACE "_" "-" target_name ${test_name})
         add_executable(${target_name}-test test/${test_name}.c)
         target_include_directories(${target_name}-test PRIVATE src include/juice)
