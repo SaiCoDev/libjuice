@@ -608,13 +608,10 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 			++registry_impl->rejected;
 			return NULL;
 		}
-		if (registry_impl->pending_required) {
-			defer_request(registry_impl, src, local_ufrag, remote_ufrag, buf, len);
-			return NULL;
-		}
 		for (int i = 0; i < registry->agents_size; ++i) {
 			agent = registry->agents[i];
-			if (is_ready(agent)) {
+			// Behind a pending listener only direct agents skip admission.
+			if (is_ready(agent) && (!registry_impl->pending_required || agent->config.mux_direct)) {
 				if (strcmp(local_ufrag, agent->local.ice_ufrag) == 0) {
 					JLOG_DEBUG("Found agent from ICE ufrag");
 					// A username match alone must never authorize the source address.
@@ -626,6 +623,10 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 					return agent;
 				}
 			}
+		}
+		if (registry_impl->pending_required) {
+			defer_request(registry_impl, src, local_ufrag, remote_ufrag, buf, len);
+			return NULL;
 		}
 
 		registry_impl_t *impl = registry->impl;
@@ -1070,7 +1071,7 @@ int conn_mux_attach_request(conn_registry_t *registry, uint64_t id, juice_agent_
 	expire_pending(impl, current_timestamp());
 	pending_request_t *request = pending_by_id(impl, id);
 	if (!request || !request->verified || request->agent) return JUICE_ERR_NOT_AVAIL;
-	if (agent->registry != registry || !is_ready(agent) ||
+	if (agent->registry != registry || agent->config.mux_direct || !is_ready(agent) ||
 	    strcmp(agent->local.ice_ufrag, request->local_ufrag) != 0 ||
 	    strcmp(agent->remote.ice_ufrag, request->remote_ufrag) != 0 ||
 	    strcmp(agent->local.ice_pwd, request->password) != 0) return JUICE_ERR_INVALID;

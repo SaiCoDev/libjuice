@@ -174,6 +174,7 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 	agent->config.cb_gathering_done = config->cb_gathering_done;
 	agent->config.cb_recv = config->cb_recv;
 	agent->config.user_ptr = config->user_ptr;
+	agent->config.mux_direct = config->mux_direct;
 	if (alloc_failed) {
 		JLOG_FATAL("Memory allocation for configuration copy failed");
 		goto error;

@@ -80,9 +80,10 @@ static void test_response(int fd) {
 	assert(!"the retained first request did not receive its authenticated response");
 }
 
-static juice_agent_t *test_agent(uint16_t port) {
+static juice_agent_t *test_mux_agent(uint16_t port, bool direct) {
 	juice_config_t config = {0};
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
+	config.mux_direct = direct;
 	config.bind_address = "127.0.0.1";
 	config.local_port_range_begin = config.local_port_range_end = port;
 	juice_agent_t *agent = juice_create(&config);
@@ -93,4 +94,6 @@ static juice_agent_t *test_agent(uint16_t port) {
 	assert(juice_gather_candidates(agent) == 0);
 	return agent;
 }
+
+static juice_agent_t *test_agent(uint16_t port) { return test_mux_agent(port, false); }
 #endif

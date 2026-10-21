@@ -170,6 +170,12 @@ typedef struct juice_config {
 
 	void *user_ptr;
 
+	/** Mux mode only. Behind a pending listener, new sources are admitted through
+	 * the listener by default. A direct agent is found by its local ICE ufrag
+	 * instead and can never be the target of juice_mux_attach_request.
+	 */
+	bool mux_direct;
+
 } juice_config_t;
 
 JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);
