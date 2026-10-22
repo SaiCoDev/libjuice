@@ -111,6 +111,19 @@ typedef struct juice_mux_pending_config {
 	unsigned int timeout_ms;  // 0 selects 5000; maximum 30000
 } juice_mux_pending_config_t;
 
+typedef struct juice_mux_admission_key {
+	const char *ufrag_prefix; // 1 to 16 characters
+	const void *secret;       // HMAC-SHA256 key, 1 to 64 bytes
+	size_t secret_size;
+} juice_mux_admission_key_t;
+
+typedef struct juice_mux_admission {
+	const void *context; // HMAC input before the local ufrag, at most 1024 bytes
+	size_t context_size;
+	const juice_mux_admission_key_t *keys;
+	int keys_count; // at most 8
+} juice_mux_admission_t;
+
 /** Called once for a pending attempt, outside the UDP registry lock.
  * Metadata is borrowed until the callback returns. Copy it to defer a decision.
  * Keep callbacks short: enqueue application work and return. Request operations
@@ -236,6 +249,14 @@ JUICE_EXPORT int juice_mux_reject_request(const char *bind_address, int local_po
 	uint64_t request_id);
 JUICE_EXPORT int juice_mux_get_stats(const char *bind_address, int local_port,
                                     juice_mux_stats_t *stats);
+/** Hold only requests whose integrity already verifies, with the password of a registered
+ * agent using the local ufrag, or with a key whose prefix starts it. A key's password is
+ * BASE64(HMAC-SHA256(secret, context || local ufrag)[0..24]). Other requests are dropped
+ * and counted as rejected. Secrets are copied. NULL holds every request again.
+ * Requires an active pending listener; stopping it clears the admission.
+ */
+JUICE_EXPORT int juice_mux_set_admission(const char *bind_address, int local_port,
+                                        const juice_mux_admission_t *admission);
 
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
 

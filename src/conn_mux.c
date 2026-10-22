@@ -8,6 +8,7 @@
 
 #include "conn_mux.h"
 #include "agent.h"
+#include "base64.h"
 #include "log.h"
 #include "socket.h"
 #include "stun.h"
@@ -22,6 +23,24 @@
 #define MAX_PENDING_PACKET_SIZE 2048
 #define MAX_NOTIFICATIONS_PER_TICK 64
 #define ICE_CHARACTERS "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+#define MAX_ADMISSION_CONTEXT 1024
+#define MAX_ADMISSION_KEYS 8
+#define MAX_ADMISSION_PREFIX 16
+#define MAX_ADMISSION_SECRET 64
+#define ADMISSION_DIGEST_SIZE 24
+
+typedef struct admission_key {
+	char prefix[MAX_ADMISSION_PREFIX + 1];
+	size_t secret_size;
+	uint8_t secret[MAX_ADMISSION_SECRET];
+} admission_key_t;
+
+typedef struct admission {
+	size_t context_size;
+	uint8_t context[MAX_ADMISSION_CONTEXT];
+	int keys_count;
+	admission_key_t keys[MAX_ADMISSION_KEYS];
+} admission_t;
 
 typedef struct pending_request {
 	struct pending_request *next;
@@ -86,6 +105,7 @@ typedef struct registry_impl {
 	pending_request_t *expiry_head, *expiry_tail;
 	pending_request_t *notify_head, *notify_tail;
 	pending_request_t *ready_head, *ready_tail;
+	admission_t *admission;
 	uint64_t received;
 	uint64_t rejected;
 	uint64_t notifications;
@@ -412,8 +432,52 @@ static pending_request_t *pending_by_id(registry_impl_t *impl, uint64_t id) {
 	return NULL;
 }
 
-static void defer_request(registry_impl_t *impl, const addr_record_t *src,
-                          const char *local, const char *remote, const char *data, size_t size) {
+static void wipe(void *data, size_t size) {
+	volatile uint8_t *bytes = data;
+	while (size--) *bytes++ = 0;
+}
+
+static void destroy_admission(registry_impl_t *impl) {
+	if (!impl->admission) return;
+	wipe(impl->admission, sizeof(*impl->admission));
+	free(impl->admission);
+	impl->admission = NULL;
+}
+
+static bool admission_verifies(conn_registry_t *registry, char *data, size_t size,
+                               const stun_message_t *msg, const char *local) {
+	const admission_t *admission = ((registry_impl_t *)registry->impl)->admission;
+	if (!admission) return true;
+	for (int i = 0; i < registry->agents_size; ++i) {
+		juice_agent_t *agent = registry->agents[i];
+		if (is_ready(agent) && *agent->local.ice_pwd != '\0' &&
+		    strcmp(local, agent->local.ice_ufrag) == 0 &&
+		    stun_check_integrity(data, size, msg, agent->local.ice_pwd))
+			return true;
+	}
+	size_t local_size = strlen(local);
+	for (int i = 0; i < admission->keys_count; ++i) {
+		const admission_key_t *key = &admission->keys[i];
+		if (strncmp(local, key->prefix, strlen(key->prefix)) != 0) continue;
+		uint8_t input[MAX_ADMISSION_CONTEXT + 256];
+		memcpy(input, admission->context, admission->context_size);
+		memcpy(input + admission->context_size, local, local_size);
+		uint8_t digest[HMAC_SHA256_SIZE];
+		hmac_sha256(input, admission->context_size + local_size, key->secret, key->secret_size,
+		            digest);
+		char password[ADMISSION_DIGEST_SIZE / 3 * 4 + 1];
+		bool verified = BASE64_ENCODE(digest, ADMISSION_DIGEST_SIZE, password, sizeof(password)) > 0 &&
+		                stun_check_integrity(data, size, msg, password);
+		wipe(digest, sizeof(digest));
+		wipe(password, sizeof(password));
+		if (verified) return true;
+	}
+	return false;
+}
+
+static void defer_request(conn_registry_t *registry, const addr_record_t *src, const char *local,
+                          const char *remote, char *data, size_t size, const stun_message_t *msg) {
+	registry_impl_t *impl = registry->impl;
 	if (!impl->cb_mux_pending || size > MAX_PENDING_PACKET_SIZE) {
 		++impl->rejected;
 		return;
@@ -428,7 +492,8 @@ static void defer_request(registry_impl_t *impl, const addr_record_t *src,
 			return; // Duplicates neither replace the first packet nor extend its deadline.
 		}
 	}
-	if (impl->pending_count >= impl->max_pending) {
+	if (impl->pending_count >= impl->max_pending ||
+	    !admission_verifies(registry, data, size, msg, local)) {
 		++impl->rejected;
 		return;
 	}
@@ -505,6 +570,7 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	JLOG_VERBOSE("Waiting for connections thread");
 	thread_join(registry_impl->thread, NULL);
 	clear_pending(registry_impl);
+	destroy_admission(registry_impl);
 	free(registry_impl->pending_buckets);
 	free(registry_impl->pending_ids);
 
@@ -629,7 +695,7 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 			return NULL;
 		}
 		if (registry_impl->pending_required) {
-			defer_request(registry_impl, src, local_ufrag, remote_ufrag, buf, len);
+			defer_request(registry, src, local_ufrag, remote_ufrag, buf, len, &msg);
 			return NULL;
 		}
 
@@ -1030,6 +1096,7 @@ int conn_mux_begin_stop_pending(conn_registry_t *registry) {
 	impl->pending_closing = true; // Keeps the registry alive until callback completion.
 	impl->cb_mux_pending = NULL;
 	impl->mux_pending_user_ptr = NULL;
+	destroy_admission(impl);
 	pending_request_t *request = impl->pending_head;
 	while (request) {
 		pending_request_t *next = request->next;
@@ -1104,4 +1171,37 @@ void conn_mux_get_stats(conn_registry_t *registry, juice_mux_stats_t *stats) {
 	registry_impl_t *impl = registry->impl;
 	*stats = (juice_mux_stats_t){impl->received, impl->rejected, registry->agents_count,
 		impl->map_count, impl->pending_count, impl->notifications, impl->duplicates};
+}
+
+int conn_mux_set_admission(conn_registry_t *registry, const juice_mux_admission_t *config) {
+	registry_impl_t *impl = registry->impl;
+	if (!impl->cb_mux_pending || impl->pending_closing) return JUICE_ERR_NOT_AVAIL;
+	if (!config) {
+		destroy_admission(impl);
+		return 0;
+	}
+	if (config->context_size > MAX_ADMISSION_CONTEXT || (config->context_size && !config->context) ||
+	    config->keys_count < 0 || config->keys_count > MAX_ADMISSION_KEYS ||
+	    (config->keys_count && !config->keys))
+		return JUICE_ERR_INVALID;
+	for (int i = 0; i < config->keys_count; ++i) {
+		const juice_mux_admission_key_t *key = &config->keys[i];
+		size_t prefix = key->ufrag_prefix ? strlen(key->ufrag_prefix) : 0;
+		if (prefix < 1 || prefix > MAX_ADMISSION_PREFIX || !key->secret || key->secret_size < 1 ||
+		    key->secret_size > MAX_ADMISSION_SECRET)
+			return JUICE_ERR_INVALID;
+	}
+	admission_t *admission = calloc(1, sizeof(*admission));
+	if (!admission) return JUICE_ERR_FAILED;
+	admission->context_size = config->context_size;
+	if (config->context_size) memcpy(admission->context, config->context, config->context_size);
+	admission->keys_count = config->keys_count;
+	for (int i = 0; i < config->keys_count; ++i) {
+		strcpy(admission->keys[i].prefix, config->keys[i].ufrag_prefix);
+		admission->keys[i].secret_size = config->keys[i].secret_size;
+		memcpy(admission->keys[i].secret, config->keys[i].secret, config->keys[i].secret_size);
+	}
+	destroy_admission(impl);
+	impl->admission = admission;
+	return 0;
 }

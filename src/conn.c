@@ -326,23 +326,34 @@ int juice_mux_listen_pending(const char *address, int port,
 	return 0;
 }
 
-static int mux_request_operation(const char *address, int port, uint64_t id,
-                                 const char *password, juice_agent_t *agent, int operation) {
-	if (!id || port < 1 || port > 65535) return JUICE_ERR_INVALID;
+// Locks an existing endpoint's registry; NULL leaves nothing locked.
+static conn_registry_t *lock_mux_registry(const char *address, int port) {
 	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
 	udp_socket_config_t config = {0};
 	config.bind_address = address;
 	config.port_begin = config.port_end = port;
 	mutex_lock(&entry->mutex);
 	conn_registry_t *registry = entry->get_registry_func(&config);
-	if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
+	if (!registry) { mutex_unlock(&entry->mutex); return NULL; }
 	mutex_lock(&registry->mutex);
+	return registry;
+}
+
+static void unlock_mux_registry(conn_registry_t *registry) {
+	mutex_unlock(&registry->mutex);
+	mutex_unlock(&get_mode_entry(JUICE_CONCURRENCY_MODE_MUX)->mutex);
+}
+
+static int mux_request_operation(const char *address, int port, uint64_t id,
+                                 const char *password, juice_agent_t *agent, int operation) {
+	if (!id || port < 1 || port > 65535) return JUICE_ERR_INVALID;
+	conn_registry_t *registry = lock_mux_registry(address, port);
+	if (!registry) return JUICE_ERR_NOT_AVAIL;
 	int result;
 	if (operation == 0) result = conn_mux_verify_request(registry, id, password);
 	else if (operation == 1) result = conn_mux_attach_request(registry, id, agent);
 	else result = conn_mux_reject_request(registry, id);
-	mutex_unlock(&registry->mutex);
-	mutex_unlock(&entry->mutex);
+	unlock_mux_registry(registry);
 	return result;
 }
 
@@ -362,16 +373,18 @@ int juice_mux_reject_request(const char *address, int port, uint64_t id) {
 
 int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats) {
 	if (!stats || port < 1 || port > 65535) return JUICE_ERR_INVALID;
-	conn_mode_entry_t *entry = get_mode_entry(JUICE_CONCURRENCY_MODE_MUX);
-	udp_socket_config_t config = {0};
-	config.bind_address = address;
-	config.port_begin = config.port_end = port;
-	mutex_lock(&entry->mutex);
-	conn_registry_t *registry = entry->get_registry_func(&config);
-	if (!registry) { mutex_unlock(&entry->mutex); return JUICE_ERR_NOT_AVAIL; }
-	mutex_lock(&registry->mutex);
+	conn_registry_t *registry = lock_mux_registry(address, port);
+	if (!registry) return JUICE_ERR_NOT_AVAIL;
 	conn_mux_get_stats(registry, stats);
-	mutex_unlock(&registry->mutex);
-	mutex_unlock(&entry->mutex);
+	unlock_mux_registry(registry);
 	return 0;
+}
+
+int juice_mux_set_admission(const char *address, int port, const juice_mux_admission_t *admission) {
+	if (port < 1 || port > 65535) return JUICE_ERR_INVALID;
+	conn_registry_t *registry = lock_mux_registry(address, port);
+	if (!registry) return JUICE_ERR_NOT_AVAIL;
+	int result = conn_mux_set_admission(registry, admission);
+	unlock_mux_registry(registry);
+	return result;
 }
