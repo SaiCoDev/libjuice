@@ -608,21 +608,25 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 			++registry_impl->rejected;
 			return NULL;
 		}
+		bool ufrag_matched = false;
 		for (int i = 0; i < registry->agents_size; ++i) {
 			agent = registry->agents[i];
 			// Behind a pending listener only direct agents skip admission.
-			if (is_ready(agent) && (!registry_impl->pending_required || agent->config.mux_direct)) {
-				if (strcmp(local_ufrag, agent->local.ice_ufrag) == 0) {
-					JLOG_DEBUG("Found agent from ICE ufrag");
-					// A username match alone must never authorize the source address.
-					if (agent_verify_stun_binding(agent, buf, len, &msg) != 0) {
-						++registry_impl->rejected;
-						return NULL;
-					}
-					if (insert_map_entry(registry_impl, src, agent) != 0) return NULL;
-					return agent;
-				}
+			if (is_ready(agent) && (!registry_impl->pending_required || agent->config.mux_direct) &&
+			    strcmp(local_ufrag, agent->local.ice_ufrag) == 0) {
+				JLOG_DEBUG("Found agent from ICE ufrag");
+				ufrag_matched = true;
+				// A username match alone must never authorize the source address. Generated ufrags
+				// are short, so another agent may share this one: only the password tells them apart.
+				if (agent_verify_stun_binding(agent, buf, len, &msg) != 0)
+					continue;
+				if (insert_map_entry(registry_impl, src, agent) != 0) return NULL;
+				return agent;
 			}
+		}
+		if (ufrag_matched) {
+			++registry_impl->rejected;
+			return NULL;
 		}
 		if (registry_impl->pending_required) {
 			defer_request(registry_impl, src, local_ufrag, remote_ufrag, buf, len);

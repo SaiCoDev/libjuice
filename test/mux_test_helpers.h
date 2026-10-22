@@ -61,7 +61,7 @@ static juice_mux_stats_t test_received(uint16_t port, uint64_t count) {
 	return stats;
 }
 
-static void test_response(int fd) {
+static void test_response_for(int fd, const char *password) {
 	for (int i = 0; i < 40; ++i) {
 		struct pollfd pfd = {.fd = fd, .events = POLLIN};
 		assert(poll(&pfd, 1, 50) >= 0);
@@ -73,14 +73,23 @@ static void test_response(int fd) {
 		assert(_juice_stun_read(response, size, &message) > 0);
 		if (message.msg_class == STUN_CLASS_RESP_SUCCESS &&
 		    memcmp(message.transaction_id, "firstrequest", STUN_TRANSACTION_ID_SIZE) == 0) {
-			assert(_juice_stun_check_integrity(response, size, &message, test_password));
+			assert(_juice_stun_check_integrity(response, size, &message, password));
 			return;
 		}
 	}
 	assert(!"the retained first request did not receive its authenticated response");
 }
 
-static juice_agent_t *test_mux_agent(uint16_t port, bool direct) {
+static void test_response(int fd) { test_response_for(fd, test_password); }
+
+/** Waits briefly and reports whether any datagram came back. */
+static bool test_answered(int fd) {
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	assert(poll(&pfd, 1, 300) >= 0);
+	return (pfd.revents & POLLIN) != 0;
+}
+
+static juice_agent_t *test_mux_agent_with(uint16_t port, bool direct, const char *password) {
 	juice_config_t config = {0};
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
 	config.mux_direct = direct;
@@ -88,11 +97,15 @@ static juice_agent_t *test_mux_agent(uint16_t port, bool direct) {
 	config.local_port_range_begin = config.local_port_range_end = port;
 	juice_agent_t *agent = juice_create(&config);
 	assert(agent);
-	assert(juice_set_local_ice_attributes(agent, "host", test_password) == 0);
+	assert(juice_set_local_ice_attributes(agent, "host", password) == 0);
 	assert(juice_set_remote_description(agent,
 	    "a=ice-ufrag:peer\r\na=ice-pwd:012345678901234567890123456789\r\n") == 0);
 	assert(juice_gather_candidates(agent) == 0);
 	return agent;
+}
+
+static juice_agent_t *test_mux_agent(uint16_t port, bool direct) {
+	return test_mux_agent_with(port, direct, test_password);
 }
 
 static juice_agent_t *test_agent(uint16_t port) { return test_mux_agent(port, false); }

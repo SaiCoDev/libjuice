@@ -87,9 +87,34 @@ static void deferred_before_ready(void) {
 	close(fd);
 }
 
+// Generated ufrags are four characters, so live agents can share one. The password decides which
+// agent a request is for, behind a pending listener and in plain mux mode alike.
+static void shared_ufrag(bool pending) {
+	static const char other_password[] = "abcdefghijabcdefghijabcdefghij";
+	atomic_store(&calls, 0);
+	uint16_t port = test_port(), source, wrong_source;
+	int fd = test_socket(&source), wrong = test_socket(&wrong_source);
+	if (pending) assert(juice_mux_listen_pending("127.0.0.1", port, NULL, incoming, NULL) == 0);
+	juice_agent_t *first = test_mux_agent_with(port, pending, test_password);
+	juice_agent_t *second = test_mux_agent_with(port, pending, other_password);
+	test_send(fd, port, "host", "peer", other_password);
+	test_response_for(fd, other_password);
+	test_send(wrong, port, "host", "peer", "wrongwrongwrongwrongwrongwrong");
+	assert(!test_answered(wrong));
+	juice_mux_stats_t stats = test_received(port, 2);
+	assert(stats.mapped_tuples == 1 && stats.rejected == 1 && atomic_load(&calls) == 0);
+	juice_destroy(second);
+	juice_destroy(first);
+	if (pending) assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
+	close(wrong);
+	close(fd);
+}
+
 int main(void) {
 	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
 	connectivity();
 	deferred_before_ready();
-	puts("direct mux agents: ufrag routing beside a pending listener, held requests stay admission-only PASS");
+	shared_ufrag(true);
+	shared_ufrag(false);
+	puts("direct mux agents: ufrag routing beside a pending listener, held requests stay admission-only, shared ufrags PASS");
 }
