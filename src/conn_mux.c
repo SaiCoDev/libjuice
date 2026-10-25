@@ -85,7 +85,7 @@ typedef struct registry_impl {
 	thread_t thread;
 	socket_t sock;
 	mutex_t send_mutex;
-	int send_ds;
+	atomic(int) send_ds;
 	map_entry_t *map;
 	int map_size;
 	int map_count;
@@ -113,7 +113,7 @@ typedef struct registry_impl {
 	uint64_t duplicates;
 	void *mux_incoming_user_ptr;
 	// Swapped under both the registry lock and send_mutex. Sends route through it under send_mutex
-	mux_proxy_t *proxy;
+	atomic_ptr(mux_proxy_t) proxy;
 } registry_impl_t;
 
 typedef struct conn_impl {
@@ -980,21 +980,30 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 	conn_impl_t *conn_impl = agent->conn_impl;
 	registry_impl_t *registry_impl = conn_impl->registry->impl;
 
-	mutex_lock(&registry_impl->send_mutex);
-
-	if (registry_impl->send_ds >= 0 && registry_impl->send_ds != ds) {
-		JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
-		if (udp_set_diffserv(registry_impl->sock, ds) == 0)
-			registry_impl->send_ds = ds;
-		else
-			registry_impl->send_ds = -1; // disable for next time
+	int send_ds = atomic_load(&registry_impl->send_ds);
+	if (send_ds >= 0 && send_ds != ds) {
+		mutex_lock(&registry_impl->send_mutex);
+		send_ds = atomic_load(&registry_impl->send_ds);
+		if (send_ds >= 0 && send_ds != ds) {
+			JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
+			atomic_store(&registry_impl->send_ds, udp_set_diffserv(registry_impl->sock, ds) == 0 ? ds : -1);
+		}
+		mutex_unlock(&registry_impl->send_mutex);
 	}
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
+	// Only routing through PROXY protocol relays needs send_mutex: the receive thread changes the
+	// flows under it, and the relay address returned points into one, so it is held across sendto
+	mux_proxy_t *proxy = atomic_load(&registry_impl->proxy);
+	bool locked = proxy != NULL;
+	if (locked) {
+		mutex_lock(&registry_impl->send_mutex);
+		proxy = atomic_load(&registry_impl->proxy);
+	}
+
 	// A client behind a relay is reached through it
-	const addr_record_t *to =
-	    registry_impl->proxy ? mux_proxy_route(registry_impl->proxy, dst) : dst;
+	const addr_record_t *to = proxy ? mux_proxy_route(proxy, dst) : dst;
 	int ret = udp_sendto(registry_impl->sock, data, size, to);
 	if (ret < 0) {
 		ret = -sockerrno;
@@ -1006,7 +1015,8 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 			JLOG_WARN("Send failed, errno=%d", sockerrno);
 	}
 
-	mutex_unlock(&registry_impl->send_mutex);
+	if (locked)
+		mutex_unlock(&registry_impl->send_mutex);
 	return ret;
 }
 
